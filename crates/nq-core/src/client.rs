@@ -147,103 +147,119 @@ impl ThroughputClient {
 
         tokio::spawn(
             async move {
+                let mut tx = Some(tx);
                 let start = time.now();
 
-                let connection = if let Some(connection) = self.connection {
-                    connection
-                } else if let Some(conn_type) = self.new_connection_type {
-                    info!("creating new connection to {host_with_port}");
+                let result: anyhow::Result<()> = async {
+                    let connection = if let Some(connection) = self.connection {
+                        connection
+                    } else if let Some(conn_type) = self.new_connection_type {
+                        info!("creating new connection to {host_with_port}");
 
-                    let addrs = network
-                        .resolve(host_with_port)
-                        .await
-                        .context("unable to resolve host")?;
+                        let addrs = network
+                            .resolve(host_with_port)
+                            .await
+                            .context("unable to resolve host")?;
 
-                    debug!("addrs: {addrs:?}");
+                        debug!("addrs: {addrs:?}");
 
-                    network
-                        .new_connection(start, addrs[0], host, conn_type)
-                        .await
-                        .context("creating new connection")?
-                } else {
-                    todo!()
-                };
-
-                let conn_timing = {
-                    let conn = connection.read().await;
-                    conn.timing()
-                };
-
-                debug!("connection used");
-                let response_fut = network.send_request(connection.clone(), request);
-
-                let mut response_body = match self.direction {
-                    Direction::Up(_) => {
-                        debug!("sending upload events");
-                        if tx
-                            .send(Ok(InflightBody {
-                                connection: connection.clone(),
-                                timing: Some(conn_timing),
-                                events: events.expect("events were set above"),
-                                start,
-                                headers,
-                            }))
-                            .is_err()
-                        {
-                            error!("error sending upload events");
-                        }
-
-                        let (parts, incoming) = response_fut.await?.into_parts();
-                        info!("upload response parts: {:?}", parts);
-
-                        incoming.boxed()
-                    }
-                    Direction::Down => {
-                        let (parts, incoming) = response_fut.await?.into_parts();
-
-                        let (counting_body, events) = CountingBody::new(
-                            incoming,
-                            Duration::from_millis(100),
-                            Arc::clone(&time),
+                        network
+                            .new_connection(start, addrs[0], host, conn_type)
+                            .await
+                            .context("creating new connection")?
+                    } else {
+                        anyhow::bail!(
+                            "either an existing connection or a connection type must be specified"
                         );
+                    };
 
-                        debug!("sending download events");
-                        if tx
-                            .send(Ok(InflightBody {
-                                connection: connection.clone(),
-                                timing: Some(conn_timing),
-                                start,
-                                events,
-                                headers: parts.headers,
-                            }))
-                            .is_err()
-                        {
-                            error!("error sending download events");
+                    let conn_timing = {
+                        let conn = connection.read().await;
+                        conn.timing()
+                    };
+
+                    debug!("connection used");
+                    let response_fut = network.send_request(connection.clone(), request);
+
+                    let mut response_body = match self.direction {
+                        Direction::Up(_) => {
+                            debug!("sending upload events");
+                            if let Some(tx) = tx.take() {
+                                if tx
+                                    .send(Ok(InflightBody {
+                                        connection: connection.clone(),
+                                        timing: Some(conn_timing),
+                                        events: events.expect("events were set above"),
+                                        start,
+                                        headers,
+                                    }))
+                                    .is_err()
+                                {
+                                    error!("error sending upload events");
+                                }
+                            }
+
+                            let (parts, incoming) = response_fut.await?.into_parts();
+                            info!("upload response parts: {:?}", parts);
+
+                            incoming.boxed()
                         }
+                        Direction::Down => {
+                            let (parts, incoming) = response_fut.await?.into_parts();
 
-                        counting_body.boxed()
-                    }
-                };
+                            let (counting_body, events) = CountingBody::new(
+                                incoming,
+                                Duration::from_millis(100),
+                                Arc::clone(&time),
+                            );
 
-                tokio::spawn(
-                    async move {
-                        // Consume the response body and keep the connection alive. Stop if we hit an error.
-                        info!("waiting for response body");
+                            debug!("sending download events");
+                            if let Some(tx) = tx.take() {
+                                if tx
+                                    .send(Ok(InflightBody {
+                                        connection: connection.clone(),
+                                        timing: Some(conn_timing),
+                                        start,
+                                        events,
+                                        headers: parts.headers,
+                                    }))
+                                    .is_err()
+                                {
+                                    error!("error sending download events");
+                                }
+                            }
 
-                        loop {
-                            select! {
-                                Some(res) = response_body.frame() => if let Err(e) = res {
-                                    error!("body closing: {e}");
-                                    break;
-                                },
-                                _ = shutdown.cancelled() => break,
+                            counting_body.boxed()
+                        }
+                    };
+
+                    tokio::spawn(
+                        async move {
+                            // Consume the response body and keep the connection alive. Stop if we hit an error.
+                            info!("waiting for response body");
+
+                            loop {
+                                select! {
+                                    Some(res) = response_body.frame() => if let Err(e) = res {
+                                        error!("body closing: {e}");
+                                        break;
+                                    },
+                                    _ = shutdown.cancelled() => break,
+                                }
                             }
                         }
-                    }
-                    .in_current_span(),
-                );
+                        .in_current_span(),
+                    );
 
-                Ok::<_, anyhow::Error>(())
+                    Ok(())
+                }
+                .await;
+
+                if let Err(e) = result {
+                    if let Some(tx) = tx.take() {
+                        let _ = tx.send(Err(e));
+                    }
+                }
             }
             .in_current_span(),
         );
@@ -329,36 +345,47 @@ impl Client {
         let (tx, rx) = oneshot_result();
         tokio::spawn(
             async move {
-                let start = time.now();
+                let result: anyhow::Result<_> = async {
+                    let start = time.now();
 
-                let connection = if let Some(connection) = self.connection {
-                    connection
-                } else if let Some(conn_type) = self.new_connection_type {
-                    info!("creating new connection");
-                    network
-                        .new_connection(start, remote_addr, host, conn_type)
-                        .await?
-                } else {
-                    todo!()
-                };
+                    let connection = if let Some(connection) = self.connection {
+                        connection
+                    } else if let Some(conn_type) = self.new_connection_type {
+                        info!("creating new connection");
+                        network
+                            .new_connection(start, remote_addr, host, conn_type)
+                            .await?
+                    } else {
+                        anyhow::bail!(
+                            "either an existing connection or a connection type must be specified"
+                        );
+                    };
 
-                // todo(fisher): fine-grained send timings for requests
-                let mut response = network.send_request(connection.clone(), request).await?;
+                    // todo(fisher): fine-grained send timings for requests
+                    let mut response = network.send_request(connection.clone(), request).await?;
 
-                let timing = {
-                    let conn = connection.read().await;
-                    conn.timing()
-                };
+                    let timing = {
+                        let conn = connection.read().await;
+                        conn.timing()
+                    };
 
-                debug!(?connection, "connection used");
+                    debug!(?connection, "connection used");
 
-                response.extensions_mut().insert(timing);
-
-                if tx.send(Ok(response)).is_err() {
-                    error!("unable to send response");
+                    response.extensions_mut().insert(timing);
+                    Ok(response)
                 }
+                .await;
 
-                Ok::<_, anyhow::Error>(())
+                match result {
+                    Ok(response) => {
+                        if tx.send(Ok(response)).is_err() {
+                            error!("unable to send response");
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                    }
+                }
             }
             .in_current_span(),
         );

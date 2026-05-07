@@ -139,9 +139,17 @@ pub fn std(samples: impl Iterator<Item = f64> + Clone) -> Option<f64> {
 /// less than the given percentile and the calculate the average.
 fn trimmed_mean(samples: impl Iterator<Item = f64> + Clone, percentile: f64) -> Option<f64> {
     let mut samples: Vec<_> = samples.collect();
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // Treat incomparable values (NaN) as equal so partial_cmp(None) does not panic.
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
 
-    let to_keep = (samples.len() as f64 * percentile) as usize;
+    // Guarantee at least 1 sample is kept when the collection is non-empty.
+    // Without this, a single-sample input at percentile 0.95 would compute
+    // `(1 * 0.95) as usize == 0`, truncate everything, and return None.
+    let to_keep = if samples.is_empty() {
+        0
+    } else {
+        ((samples.len() as f64 * percentile) as usize).max(1)
+    };
     samples.truncate(to_keep);
 
     average(samples.into_iter())
@@ -259,5 +267,19 @@ mod tests {
 
         let trimmed_mean = ts.interval_trimmed_mean(from, to, percentile).unwrap();
         assert_eq!(trimmed_mean, 15.0);
+    }
+
+    #[test]
+    fn trimmed_mean_keeps_sparse_samples() {
+        let mut ts = TimeSeries::new();
+        let now = Timestamp::now();
+
+        assert_eq!(ts.trimmed_mean(0.95), None);
+
+        ts.add(now, 42.0);
+        assert_eq!(ts.trimmed_mean(0.95), Some(42.0));
+
+        ts.add(now + Duration::from_secs(1), 100.0);
+        assert_eq!(ts.trimmed_mean(0.95), Some(42.0));
     }
 }

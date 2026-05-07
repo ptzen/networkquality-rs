@@ -17,9 +17,12 @@ use nq_core::{
 };
 use nq_load_generator::{LoadConfig, LoadGenerator, LoadedConnection};
 use nq_stats::{instant_minus_intervals, TimeSeries};
-use tokio::{select, sync::mpsc};
+use tokio::{
+    select,
+    sync::{mpsc, oneshot::error::RecvError},
+};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, Instrument};
+use tracing::{debug, info, warn, Instrument};
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -68,6 +71,10 @@ impl Default for ResponsivenessConfig {
     }
 }
 
+// Allow some transient probe failures (connection refused, TLS errors, etc.)
+// before aborting the test.
+const MAX_CONSECUTIVE_PROBE_FAILURES: usize = 5;
+
 pub struct Responsiveness {
     start: Timestamp,
     config: ResponsivenessConfig,
@@ -81,6 +88,11 @@ pub struct Responsiveness {
     direction: Direction,
     rpm: f64,
     capacity: f64,
+    // New loads are created asynchronously. Count requests that have been
+    // launched but have not yet produced an event, otherwise the interval loop
+    // can schedule past the configured cap before completions arrive on event_rx.
+    pending_load_generating_connections: usize,
+    consecutive_probe_failures: usize,
 }
 
 impl Responsiveness {
@@ -104,6 +116,8 @@ impl Responsiveness {
             },
             rpm: 0.0,
             capacity: 0.0,
+            pending_load_generating_connections: 0,
+            consecutive_probe_failures: 0,
         })
     }
 }
@@ -112,8 +126,10 @@ impl Responsiveness {
     /// Run the responsiveness tests. This is a simple event loop which:
     /// - executes an interval of the RPM algorithm every `interval_duration`
     ///   seconds.
-    /// - sends alternating self and foreign probes. todo(fisher): need to limit
-    ///   to 100 probes/sec. (simple semaphore enough?).
+    /// - sends alternating self and foreign probes. Probe failures are tracked
+    ///   and the chain is restarted so transient errors do not stop later
+    ///   measurements. todo(fisher): need to limit to 100 probes/sec.
+    ///   (simple semaphore enough?).
     ///
     /// When the test completes or the test has been running too long, the test
     /// completes and the results are reported.
@@ -144,9 +160,20 @@ impl Responsiveness {
                 Some(event) = event_rx.recv() => {
                     match event {
                         Event::NewLoadedConnection(connection) => {
+                            // The async load creation has completed; the load is
+                            // now tracked by load_generator instead of pending.
+                            self.pending_load_generating_connections =
+                                self.pending_load_generating_connections.saturating_sub(1);
                             self.load_generator.push(connection);
                         }
+                        Event::LoadGeneratingConnectionError(e) => {
+                            // Failed creations still clear their pending slot.
+                            self.pending_load_generating_connections =
+                                self.pending_load_generating_connections.saturating_sub(1);
+                            return Err(e);
+                        }
                         Event::ForeignProbe(f) => {
+                            self.consecutive_probe_failures = 0;
                             self.foreign_probe_results.add(f);
 
                             // There might not be an available load generating
@@ -157,12 +184,32 @@ impl Responsiveness {
                             }
                         }
                         Event::SelfProbe(s) => {
+                            self.consecutive_probe_failures = 0;
                             self.self_probe_results.add(s);
 
                             self.send_foreign_probe(event_tx.clone(), &env, shutdown.clone())?;
                         }
-                        Event::Error(e) => {
-                            error!("error: {e}");
+                        Event::ProbeFailure(e) => {
+                            if e.downcast_ref::<RecvError>().is_some() {
+                                debug!("skipping benign probe error: {e}");
+                            } else {
+                                self.consecutive_probe_failures += 1;
+                                warn!(
+                                    "probe error ({}/{}): {e}",
+                                    self.consecutive_probe_failures,
+                                    MAX_CONSECUTIVE_PROBE_FAILURES
+                                );
+                                if self.consecutive_probe_failures >= MAX_CONSECUTIVE_PROBE_FAILURES {
+                                    return Err(e.context(format!(
+                                        "aborting after {} consecutive probe failures",
+                                        MAX_CONSECUTIVE_PROBE_FAILURES
+                                    )));
+                                }
+                            }
+
+                            // Restart the probe chain so a single failure doesn't
+                            // stop all future probes for the rest of the test.
+                            self.send_foreign_probe(event_tx.clone(), &env, shutdown.clone())?;
                         }
                     }
                 }
@@ -193,9 +240,34 @@ impl Responsiveness {
 
         let now = env.time.now();
         if self.rpm == 0.0 {
+            let from = instant_minus_intervals(
+                now,
+                self.config.moving_average_distance,
+                self.config.interval_duration,
+            );
+            // First use the final MAD window of valid interval RPM samples.
+            // If that window is empty, use the latest RPM value already
+            // computed by the interval algorithm.
             self.rpm = self
                 .rpm_series
-                .interval_average(now - Duration::from_secs(2), now)
+                .interval_average(from, now)
+                .or_else(|| self.rpm_series.samples().last().map(|(_, rpm)| *rpm))
+                .or_else(|| {
+                    // If no interval RPM was computed, use all raw probe data
+                    // as a best-effort estimate. This is lower confidence than
+                    // a stable MAD-window result, but avoids reporting 0 when
+                    // complete foreign and self probe data was collected without
+                    // aligning into an interval window. draft-08 exposes
+                    // confidence for this distinction; this branch keeps the
+                    // existing result shape until confidence is reported explicitly.
+                    compute_responsiveness(
+                        &self.foreign_probe_results,
+                        &self.self_probe_results,
+                        self.start,
+                        now,
+                        self.config.trimmed_mean_percent,
+                    )
+                })
                 .unwrap_or(0.0);
         }
 
@@ -245,7 +317,7 @@ impl Responsiveness {
         env: &Env,
         shutdown: CancellationToken,
     ) -> anyhow::Result<bool> {
-        // Determine the currently interval and round it to the interval duration.
+        // Determine the current interval and round it to the interval duration.
         let end_data_interval = self.start + self.config.interval_duration * interval as u32;
         let start_data_interval = instant_minus_intervals(
             end_data_interval,
@@ -255,7 +327,11 @@ impl Responsiveness {
 
         // always start a load generating connection
         // TODO: only if goodput is not saturated?
-        if self.load_generator.count_loads() < self.config.max_loaded_connections
+        // Include pending creations so the scheduler sees the number of loads
+        // that will exist once in-flight setup tasks complete.
+        let total_load_generating_connections =
+            self.load_generator.count_loads() + self.pending_load_generating_connections;
+        if total_load_generating_connections < self.config.max_loaded_connections
             && interval % 2 == 0
         {
             self.new_load_generating_connection(event_tx, env, shutdown)?;
@@ -286,31 +362,47 @@ impl Responsiveness {
             start_data_interval,
             end_data_interval,
             self.config.trimmed_mean_percent,
-        )
-        .unwrap_or(0.0);
+        );
 
-        if current_rpm.is_nan() {
-            panic!("NaN rpm!");
+        let current_rpm_log = current_rpm.unwrap_or(0.0);
+
+        if let Some(rpm) = current_rpm {
+            anyhow::ensure!(!rpm.is_nan(), "computed NaN RPM from probe data");
         }
 
-        self.rpm_series.add(end_data_interval, current_rpm);
-
-        let std_rpm = self
-            .rpm_series
-            .interval_std(start_data_interval, end_data_interval);
-
-        let is_rpm_saturated = if let Some(std_rpm) = std_rpm {
-            // RPM is saturated if the std of the last MAD RPMs is
-            // within tolerance % of the current_rpm.
-            if std_rpm < current_rpm * self.config.std_tolerance {
-                self.rpm = current_rpm;
-                self.rpm_saturated = true;
-                true
-            } else {
-                false
-            }
+        // compute_responsiveness returns None when a window is missing any
+        // required probe component. Doesn't synthesize a 0 RPM sample for an
+        // incomplete measurement window and only includes measured RPM values
+        // in the moving average.
+        let std_rpm = if let Some(rpm) = current_rpm {
+            self.rpm_series.add(end_data_interval, rpm);
+            self.rpm_series
+                .interval_std(start_data_interval, end_data_interval)
         } else {
-            false
+            self.rpm_series
+                .interval_std(start_data_interval, end_data_interval)
+        };
+
+        let has_mad_rpm_samples = self
+            .rpm_series
+            .sample_interval(start_data_interval, end_data_interval)
+            .count()
+            >= self.config.moving_average_distance;
+
+        let is_rpm_saturated = match (current_rpm, std_rpm) {
+            (Some(current_rpm), Some(std_rpm)) => {
+                // interval_std() is 0.0 for one sample, so require a full MAD
+                // window before declaring RPM saturation; otherwise the first
+                // valid RPM would terminate the test early.
+                if has_mad_rpm_samples && std_rpm < current_rpm * self.config.std_tolerance {
+                    self.rpm = current_rpm;
+                    self.rpm_saturated = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
         };
 
         self.log_interval(
@@ -318,7 +410,7 @@ impl Responsiveness {
             current_goodput,
             std_goodput,
             goodput_saturated,
-            current_rpm,
+            current_rpm_log,
             std_rpm,
             is_rpm_saturated,
         );
@@ -396,7 +488,7 @@ impl Responsiveness {
     /// a single connection's flow.
     #[tracing::instrument(skip_all)]
     fn new_load_generating_connection(
-        &self,
+        &mut self,
         event_tx: mpsc::Sender<Event>,
         env: &Env,
         shutdown: CancellationToken,
@@ -413,12 +505,16 @@ impl Responsiveness {
             async move {
                 let _ = match oneshot_res.await {
                     Ok(conn) => event_tx.send(Event::NewLoadedConnection(conn)),
-                    Err(e) => event_tx.send(Event::Error(e)),
+                    Err(e) => event_tx.send(Event::LoadGeneratingConnectionError(e)),
                 }
                 .await;
             }
             .in_current_span(),
         );
+
+        // Track the in-flight creation until either a connection or an error
+        // is delivered back to the event loop.
+        self.pending_load_generating_connections += 1;
 
         Ok(())
     }
@@ -438,21 +534,28 @@ impl Responsiveness {
         env: &Env,
         shutdown: CancellationToken,
     ) -> anyhow::Result<()> {
+        let probe_shutdown = shutdown.child_token();
         let inflight_body_fut = ThroughputClient::download()
             .new_connection(ConnectionType::H2)
             .send(
                 self.config.small_download_url.as_str().parse()?,
                 Arc::clone(&env.network),
                 Arc::clone(&env.time),
-                shutdown,
+                probe_shutdown.clone(),
             )?;
 
-        tokio::spawn(report_err(
+        tokio::spawn(report_probe_err(
             event_tx.clone(),
             async move {
                 let inflight_body = inflight_body_fut.await?;
 
                 let finished_result = wait_for_finish(inflight_body.events).await?;
+                probe_shutdown.cancel();
+
+                {
+                    let mut connection = inflight_body.connection.write().await;
+                    connection.drop_send_request();
+                }
 
                 let Some(connection_timing) = inflight_body.timing else {
                     anyhow::bail!("a new connection with timing should have been created");
@@ -470,7 +573,9 @@ impl Responsiveness {
                     .await
                     .is_err()
                 {
-                    anyhow::bail!("unable to send foreign probe result");
+                    // The event loop may have exited due to timeout or shutdown;
+                    // the probe succeeded, but there is no receiver left for the result.
+                    return Ok(());
                 }
 
                 Ok(())
@@ -506,21 +611,23 @@ impl Responsiveness {
             return Ok(false);
         };
 
+        let probe_shutdown = shutdown.child_token();
         let inflight_body_fut = ThroughputClient::download()
             .with_connection(connection)
             .send(
                 self.config.small_download_url.as_str().parse()?,
                 Arc::clone(&env.network),
                 Arc::clone(&env.time),
-                shutdown,
+                probe_shutdown.clone(),
             )?;
 
-        tokio::spawn(report_err(
+        tokio::spawn(report_probe_err(
             event_tx.clone(),
             async move {
                 let inflight_body = inflight_body_fut.await?;
 
                 let finish_result = wait_for_finish(inflight_body.events).await?;
+                probe_shutdown.cancel();
                 debug!("self_probe_finished: {finish_result:?}");
 
                 if event_tx
@@ -533,7 +640,9 @@ impl Responsiveness {
                     .await
                     .is_err()
                 {
-                    anyhow::bail!("unable to send self probe result");
+                    // The event loop may have exited due to timeout or shutdown;
+                    // the probe succeeded, but there is no receiver left for the result.
+                    return Ok(());
                 }
 
                 Ok(())
@@ -545,9 +654,12 @@ impl Responsiveness {
     }
 }
 
-async fn report_err(event_tx: mpsc::Sender<Event>, f: impl Future<Output = anyhow::Result<()>>) {
+async fn report_probe_err(
+    event_tx: mpsc::Sender<Event>,
+    f: impl Future<Output = anyhow::Result<()>>,
+) {
     if let Err(e) = f.await {
-        let _ = event_tx.send(Event::Error(e)).await;
+        let _ = event_tx.send(Event::ProbeFailure(e)).await;
     }
 }
 
@@ -638,8 +750,9 @@ pub struct SelfProbeResult {
 enum Event {
     ForeignProbe(ForeignProbeResult),
     SelfProbe(SelfProbeResult),
+    ProbeFailure(anyhow::Error),
     NewLoadedConnection(LoadedConnection),
-    Error(anyhow::Error),
+    LoadGeneratingConnectionError(anyhow::Error),
 }
 
 impl Debug for Event {
@@ -647,8 +760,11 @@ impl Debug for Event {
         match self {
             Self::ForeignProbe(_) => f.debug_tuple("ForeignProbe").finish(),
             Self::SelfProbe(_) => f.debug_tuple("SelfProbe").finish(),
+            Self::ProbeFailure(_) => f.debug_tuple("ProbeFailure").finish(),
             Self::NewLoadedConnection(_) => f.debug_tuple("NewLoadedConnection").finish(),
-            Self::Error(_) => f.debug_tuple("Error").finish(),
+            Self::LoadGeneratingConnectionError(_) => {
+                f.debug_tuple("LoadGeneratingConnectionError").finish()
+            }
         }
     }
 }
@@ -691,5 +807,57 @@ impl Display for ResponsivenessResult {
             format_size(self.capacity as usize, custom_options)
         )?;
         write!(f, "{:>8}: {}", "rpm", self.rpm.round() as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_responsiveness_requires_all_probe_components() {
+        let now = Timestamp::now();
+        let from = now - Duration::from_secs(1);
+        let mut foreign_results = ForeignProbeResults::default();
+        let mut self_results = SelfProbeResults::default();
+
+        self_results.add(SelfProbeResult {
+            start: now,
+            time_body: Duration::from_millis(10),
+        });
+
+        assert!(compute_responsiveness(&foreign_results, &self_results, from, now, 0.95).is_none());
+
+        foreign_results.add(ForeignProbeResult {
+            start: now,
+            time_connect: Duration::from_millis(10),
+            time_secure: Duration::from_millis(10),
+            time_body: Duration::from_millis(10),
+        });
+
+        assert!(compute_responsiveness(&foreign_results, &self_results, from, now, 0.95).is_some());
+    }
+
+    #[test]
+    fn compute_responsiveness_can_use_sparse_complete_probe_data() {
+        let start = Timestamp::now();
+        let end = start + Duration::from_secs(10);
+        let mut foreign_results = ForeignProbeResults::default();
+        let mut self_results = SelfProbeResults::default();
+
+        foreign_results.add(ForeignProbeResult {
+            start: start + Duration::from_secs(1),
+            time_connect: Duration::from_millis(20),
+            time_secure: Duration::from_millis(20),
+            time_body: Duration::from_millis(20),
+        });
+        self_results.add(SelfProbeResult {
+            start: start + Duration::from_secs(8),
+            time_body: Duration::from_millis(20),
+        });
+
+        let rpm = compute_responsiveness(&foreign_results, &self_results, start, end, 0.95);
+
+        assert!(rpm.is_some());
     }
 }

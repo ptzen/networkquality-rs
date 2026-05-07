@@ -83,18 +83,21 @@ impl LoadGenerator {
 
         tokio::spawn(
             async move {
-                let inflight_body = response_fut
+                let result = response_fut
                     .await
-                    .context("could not await response for loaded connection")?;
+                    .context("could not await response for loaded connection")
+                    .map(|inflight_body| {
+                        tracing::debug!("sending loaded connection");
 
-                tracing::debug!("sending loaded connection");
+                        LoadedConnection {
+                            connection: inflight_body.connection,
+                            events_rx: inflight_body.events,
+                            total_bytes_series: CounterSeries::new(),
+                            finished_at: None,
+                        }
+                    });
 
-                let _ = tx.send(Ok(LoadedConnection {
-                    connection: inflight_body.connection,
-                    events_rx: inflight_body.events,
-                    total_bytes_series: CounterSeries::new(),
-                    finished_at: None,
-                }));
+                let _ = tx.send(result);
 
                 Ok::<_, anyhow::Error>(())
             }
